@@ -1,0 +1,577 @@
+# Docker Notes
+
+---
+
+## Docker Day 3 — Volumes & Networking
+
+---
+
+### Why This is Critical for DevOps
+
+Containers have a fundamental problem — they are stateless by default.
+
+When you stop and remove a container — everything inside it is gone. Database records, uploaded files, log files — all deleted. In production this is a disaster.
+
+Another problem — containers need to talk to each other. Your web app container needs to reach your database container. Your nginx container needs to forward requests to your application container.
+
+**Volumes solve the data problem. Networking solves the communication problem. Both are essential for real applications.**
+
+---
+
+### What You Will Learn Today
+
+- Why containers lose data without volumes
+- Three types of storage in Docker
+- Named volumes — the right way to persist data
+- Bind mounts — connecting host files to containers
+- Volume commands
+- Docker networking basics
+- Bridge, host and none networks
+- Container-to-container communication
+- Creating custom networks
+- Real multi-container scenario
+
+---
+
+## Part 1 — Docker Volumes
+
+### The Data Problem — Demo First
+
+```bash
+# Start a container and create a file:
+docker run -it --name test-data ubuntu bash
+# Inside container:
+echo "important data" > /data/myfile.txt
+exit
+
+# Remove container:
+docker rm test-data
+
+# Run new container — file is GONE:
+docker run -it --name test-data ubuntu bash
+cat /data/myfile.txt    # No such file or directory
+```
+
+Every container starts fresh. No memory of previous run. For databases and file storage — this is unacceptable.
+
+---
+
+### Three Types of Docker Storage
+
+| Type | What it is | When to use |
+|---|---|---|
+| Named Volume | Docker-managed storage on host | Database data, persistent app data |
+| Bind Mount | Map specific host folder to container | Development — live code reload |
+| tmpfs | Memory only — lost on stop | Sensitive temp data, caching |
+
+```
+Host Machine
+┌──────────────────────────────────────────────┐
+│  /var/lib/docker/volumes/  ←── Named Volume  │
+│  /home/varun/myapp/        ←── Bind Mount    │
+│                                              │
+│  ┌──────────────────┐                        │
+│  │    Container     │                        │
+│  │  /app/data ────────────── Named Volume    │
+│  │  /app/code ────────────── Bind Mount      │
+│  │  /tmp      ────────────── tmpfs (memory)  │
+│  └──────────────────┘                        │
+└──────────────────────────────────────────────┘
+```
+
+---
+
+## Named Volumes — The Right Way
+
+A named volume is storage that Docker manages for you. It lives in `/var/lib/docker/volumes/` on the host. Containers can attach to it — data persists even if the container is deleted.
+
+```bash
+# Create a named volume:
+docker volume create mydata
+
+# Run container with volume attached:
+docker run -d \
+  --name myapp \
+  -v mydata:/app/data \
+  ubuntu sleep infinity
+
+# Write data inside container:
+docker exec myapp bash -c "echo 'persistent data' > /app/data/file.txt"
+
+# Remove container:
+docker rm -f myapp
+
+# New container — same volume — data is still there:
+docker run --rm \
+  -v mydata:/app/data \
+  ubuntu cat /app/data/file.txt
+# Output: persistent data
+```
+
+Data survived the container deletion completely.
+
+---
+
+### Volume Commands
+
+```bash
+docker volume create mydata          # create named volume
+docker volume ls                     # list all volumes
+docker volume inspect mydata         # detailed info — where it lives on host
+docker volume rm mydata              # remove volume — deletes all data
+docker volume prune                  # remove ALL unused volumes
+```
+
+### Inspecting a Volume
+
+```bash
+docker volume inspect mydata
+```
+
+```json
+[
+  {
+    "Name": "mydata",
+    "Driver": "local",
+    "Mountpoint": "/var/lib/docker/volumes/mydata/_data",
+    "Labels": {},
+    "Scope": "local"
+  }
+]
+```
+
+The actual data lives at `/var/lib/docker/volumes/mydata/_data` on your host machine.
+
+---
+
+### Real Example — MySQL with Persistent Data
+
+```bash
+# WITHOUT volume — data lost when container removed:
+docker run -d --name mysql-bad mysql:8.0 -e MYSQL_ROOT_PASSWORD=pass
+
+# WITH volume — data persists forever:
+docker run -d \
+  --name mysql-db \
+  -e MYSQL_ROOT_PASSWORD=secretpass \
+  -e MYSQL_DATABASE=myapp \
+  -v mysql-data:/var/lib/mysql \
+  -p 3306:3306 \
+  mysql:8.0
+
+# Even if you remove and recreate the container:
+docker rm -f mysql-db
+docker run -d \
+  --name mysql-db \
+  -e MYSQL_ROOT_PASSWORD=secretpass \
+  -v mysql-data:/var/lib/mysql \
+  -p 3306:3306 \
+  mysql:8.0
+# All your database records are still there!
+```
+
+---
+
+## Bind Mounts — Development Workflow
+
+A bind mount maps a specific folder from your host machine into the container. Changes on host appear immediately in container and vice versa.
+
+```bash
+# Syntax:
+docker run -v /host/path:/container/path image
+
+# Example:
+docker run -d \
+  --name dev-nginx \
+  -p 8080:80 \
+  -v $(pwd)/html:/usr/share/nginx/html \
+  nginx
+```
+
+Now:
+- Edit `./html/index.html` on your laptop
+- Refresh browser — changes appear immediately
+- No rebuild needed
+
+This is how developers work with Docker — live reload without rebuilding images.
+
+---
+
+### Named Volume vs Bind Mount
+
+| Named Volume | Bind Mount |
+|---|---|
+| Docker manages storage location | You specify exact host path |
+| Works on any OS consistently | Path must exist on host |
+| Best for production data | Best for development |
+| Backed up with `docker volume` | Backed up normally with host |
+| Hard to edit easily from host | Easy to edit from host |
+
+```bash
+# Named volume — Docker manages location:
+-v mydata:/app/data              # volume name : container path
+
+# Bind mount — you control location:
+-v /home/varun/myapp:/app/data   # host path : container path
+-v $(pwd):/app                   # current directory
+```
+
+---
+
+### Read-Only Bind Mounts
+
+```bash
+# Container can read but NOT write:
+docker run -v $(pwd)/config:/app/config:ro nginx
+
+# Useful for:
+# — Config files you don't want container to modify
+# — Source code in production
+# — SSL certificates
+```
+
+---
+
+### Backup and Restore Volumes
+
+```bash
+# Backup a volume to tar file:
+docker run --rm \
+  -v mysql-data:/data \
+  -v $(pwd):/backup \
+  ubuntu \
+  tar -czf /backup/mysql-backup.tar.gz /data
+
+# Restore volume from backup:
+docker run --rm \
+  -v mysql-data:/data \
+  -v $(pwd):/backup \
+  ubuntu \
+  tar -xzf /backup/mysql-backup.tar.gz -C /
+```
+
+---
+
+## Part 2 — Docker Networking
+
+### Why Containers Need Networking
+
+```
+Without networking:
+[Web App Container]          [Database Container]
+        ↑                            ↑
+        Cannot reach each other — isolated by default
+
+With Docker network:
+[Web App Container] ←── mynetwork ──→ [Database Container]
+        Can communicate using container names
+```
+
+---
+
+### Three Built-in Network Types
+
+```bash
+docker network ls    # list all networks
+
+NETWORK ID     NAME      DRIVER    SCOPE
+a1b2c3d4e5f6   bridge    bridge    local
+b2c3d4e5f6g7   host      host      local
+c3d4e5f6g7h8   none      null      local
+```
+
+| Network | What it is | When to use |
+|---|---|---|
+| `bridge` (default) | Default — containers communicate by IP only | Single container |
+| `host` | Container uses host network directly | High performance (Linux only) |
+| `none` | No network access | Complete isolation |
+| Custom bridge | Containers communicate by name | Multi-container apps |
+
+---
+
+### Bridge Network — Default
+
+When you run a container without specifying a network — it joins the default bridge network.
+
+```bash
+# Both on default bridge:
+docker run -d --name app1 nginx
+docker run -d --name app2 nginx
+
+# app1 and app2 can communicate by IP address
+# BUT NOT by container name on default bridge
+docker inspect app1 | grep IPAddress    # find IP
+```
+
+**Problem with default bridge:** Containers cannot reach each other by name — only by IP. IP addresses change — not reliable.
+
+---
+
+### Host Network — Use Host Networking Directly
+
+Container shares the host machine's network stack completely. No port mapping needed.
+
+```bash
+docker run -d --network host nginx
+# nginx now listens on host port 80 directly
+# curl http://localhost:80 works without -p flag
+```
+
+| Use case | Notes |
+|---|---|
+| High performance networking | No NAT overhead |
+| Linux only | Does not work on Mac or Windows Docker |
+| Port conflicts possible | Container uses host ports directly |
+
+---
+
+### None Network — Complete Isolation
+
+```bash
+docker run -d --network none myapp
+# Cannot reach internet, cannot be reached
+# Use for: batch processing, security-sensitive workloads
+```
+
+---
+
+### Custom Bridge Network — The Right Way
+
+Custom networks solve the container name resolution problem. Containers on the same custom network can find each other by container name.
+
+```bash
+# Create custom network:
+docker network create myapp-network
+
+# Run containers on that network:
+docker run -d \
+  --name webapp \
+  --network myapp-network \
+  nginx
+
+docker run -d \
+  --name database \
+  --network myapp-network \
+  mysql:8.0 -e MYSQL_ROOT_PASSWORD=pass
+
+# webapp can now reach database using hostname "database":
+docker exec webapp curl http://database:3306
+docker exec webapp ping database    # resolves by name!
+```
+
+---
+
+### Network Commands
+
+```bash
+docker network create myapp-network          # create network
+docker network create --driver bridge mynet  # explicit driver
+docker network ls                            # list all networks
+docker network inspect myapp-network         # detailed info
+docker network rm myapp-network              # remove network
+docker network prune                         # remove unused networks
+
+# Connect/disconnect running container:
+docker network connect myapp-network mycontainer
+docker network disconnect myapp-network mycontainer
+```
+
+---
+
+## Real Multi-Container Application
+
+### Scenario — Web App + Database + Nginx Proxy
+
+```
+Internet → [Nginx Proxy :80] → [Flask App :5000] → [MySQL :3306]
+                                        ↓
+                               [Volume: app-data]
+```
+
+### Step 1 — Create Network
+
+```bash
+docker network create webapp-network
+```
+
+### Step 2 — Start Database with Volume
+
+```bash
+docker run -d \
+  --name mysql-db \
+  --network webapp-network \
+  -e MYSQL_ROOT_PASSWORD=secretpass \
+  -e MYSQL_DATABASE=myapp \
+  -e MYSQL_USER=appuser \
+  -e MYSQL_PASSWORD=apppass \
+  -v mysql-data:/var/lib/mysql \
+  mysql:8.0
+```
+
+### Step 3 — Start Application
+
+```bash
+docker run -d \
+  --name flask-app \
+  --network webapp-network \
+  -e DB_HOST=mysql-db \
+  -e DB_USER=appuser \
+  -e DB_PASSWORD=apppass \
+  -e DB_NAME=myapp \
+  -v app-uploads:/app/uploads \
+  myflaskapp:1.0
+```
+
+Notice `DB_HOST=mysql-db` — the app reaches the database using the container name as the hostname. This works because both are on `webapp-network`.
+
+### Step 4 — Start Nginx as Reverse Proxy
+
+```bash
+docker run -d \
+  --name nginx-proxy \
+  --network webapp-network \
+  -p 80:80 \
+  -v $(pwd)/nginx.conf:/etc/nginx/conf.d/default.conf:ro \
+  nginx:alpine
+```
+
+`nginx.conf` on host:
+
+```nginx
+server {
+    listen 80;
+    location / {
+        proxy_pass http://flask-app:5000;
+    }
+}
+```
+
+Nginx forwards all traffic to `flask-app:5000` — using container name as hostname.
+
+### Step 5 — Verify Everything
+
+```bash
+docker ps                                   # all 3 containers running?
+docker network inspect webapp-network       # all 3 on same network?
+curl http://localhost                       # does the app respond?
+docker logs flask-app                       # any errors?
+```
+
+### Cleanup
+
+```bash
+docker stop nginx-proxy flask-app mysql-db
+docker rm nginx-proxy flask-app mysql-db
+docker network rm webapp-network
+# Volumes kept — data preserved
+docker volume ls    # mysql-data and app-uploads still exist
+```
+
+---
+
+## Port Mapping Deep Dive
+
+```bash
+docker run -p 8080:80 nginx
+#              |   |
+#              |   └── Container port (nginx listens here)
+#              └──────── Host port (you access this from outside)
+
+# Your browser → localhost:8080 → Docker → Container:80 → nginx
+```
+
+**Multiple port mappings:**
+
+```bash
+docker run -d \
+  -p 8080:80 \     # HTTP
+  -p 8443:443 \    # HTTPS
+  --name multi-port-app \
+  nginx
+```
+
+**Bind to specific interface:**
+
+```bash
+docker run -p 127.0.0.1:8080:80 nginx    # only localhost can access
+docker run -p 0.0.0.0:8080:80 nginx      # anyone can access (default)
+```
+
+In production — bind sensitive services to `127.0.0.1` only.
+
+```bash
+docker port my-nginx        # show port mappings for container
+```
+
+---
+
+## Full Summary — Docker Day 3
+
+### Volume Commands
+
+| Command | What it does |
+|---|---|
+| `docker volume create name` | Create named volume |
+| `docker volume ls` | List all volumes |
+| `docker volume inspect name` | Detailed volume info |
+| `docker volume rm name` | Delete volume and data |
+| `docker volume prune` | Delete all unused volumes |
+| `-v name:/container/path` | Attach named volume |
+| `-v /host/path:/container/path` | Bind mount |
+| `-v /host/path:/container/path:ro` | Read-only bind mount |
+
+### Network Commands
+
+| Command | What it does |
+|---|---|
+| `docker network create name` | Create custom network |
+| `docker network ls` | List all networks |
+| `docker network inspect name` | Detailed network info |
+| `docker network rm name` | Remove network |
+| `docker network prune` | Remove unused networks |
+| `docker network connect net container` | Connect container to network |
+| `--network name` | Run container on specific network |
+
+---
+
+### Interview Questions — Docker Day 3
+
+**Q1. Why do containers lose data when stopped?**
+Containers have a writable layer on top of the read-only image layers. When a container is removed this writable layer is deleted. Data written inside the container lives in this layer — no container means no data. Volumes solve this by storing data outside the container lifecycle.
+
+**Q2. What is the difference between a named volume and a bind mount?**
+Named volumes are managed by Docker — stored in `/var/lib/docker/volumes/` — best for production data persistence. Bind mounts map a specific host directory into the container — best for development where you want live code changes without rebuilding. Named volumes are more portable and work consistently across OSes.
+
+**Q3. What is the difference between the default bridge network and a custom bridge network?**
+On the default bridge network containers can only communicate by IP address — not by name. On a custom bridge network Docker provides automatic DNS resolution — containers find each other using container names as hostnames. Always create custom networks for multi-container applications.
+
+**Q4. How do containers on the same network communicate?**
+Containers on the same custom Docker network communicate using container names as hostnames. Docker's internal DNS resolves container names to their IP addresses automatically. Example: a web app container can reach a database container at hostname "mysql-db" if both are on the same network.
+
+**Q5. What is a reverse proxy in Docker context?**
+A container running nginx or similar that receives all incoming traffic and forwards it to application containers on the internal network. Only the proxy is exposed on host ports — application containers are not directly reachable from outside. Provides a single entry point, SSL termination and load balancing.
+
+**Q6. What happens to volume data when you remove a container?**
+Volume data is NOT deleted when a container is removed — it persists independently. Only the container itself is deleted. The data remains in the volume and can be attached to a new container. You must explicitly run `docker volume rm` to delete volume data.
+
+**Q7. What does `-p 127.0.0.1:8080:80` do differently from `-p 8080:80`?**
+`-p 8080:80` binds to all interfaces (0.0.0.0) — anyone on the network can access it. `-p 127.0.0.1:8080:80` binds only to localhost — only connections from the same machine are accepted. Use localhost binding for sensitive internal services that should not be publicly accessible.
+
+---
+
+### Homework — Before Docker Day 4
+
+```bash
+mkdir ~/docker-multicontainer
+cd ~/docker-multicontainer
+```
+
+1. Create a named volume: `docker volume create mydata`
+2. Run a container, write data to the volume, stop and remove it
+3. Run a new container with the same volume — verify data is there
+4. Create a custom network: `docker network create mynet`
+5. Run two containers on `mynet` and verify they can ping each other by name
+6. Run nginx with a bind mount connecting `$(pwd)/html` to `/usr/share/nginx/html`
+7. Edit `html/index.html` while nginx runs — verify changes appear at `localhost:8080`
+
+---
